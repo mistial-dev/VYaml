@@ -30,6 +30,12 @@
         <Compile Include="..\VYaml\Serialization\NamingConventionMutator.cs">
             <Link>NamingConventionMutator.cs</Link>
         </Compile>
+        <Compile Include="..\VYaml\Internal\PlatformStackLimits.cs">
+            <Link>Internal\PlatformStackLimits.cs</Link>
+        </Compile>
+        <Compile Include="..\VYaml\Internal\CharBufferPool.cs">
+            <Link>Internal\CharBufferPool.cs</Link>
+        </Compile>
     </ItemGroup>
 
     <ItemGroup>

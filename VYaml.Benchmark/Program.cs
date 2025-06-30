@@ -11,7 +11,7 @@ namespace VYaml.Benchmark;
 
 static class Program
 {
-    static int Main()
+    static int Main(string[] args)
     {
         var switcher = new BenchmarkSwitcher([
             typeof(DeserializationBenchmark),
@@ -20,7 +20,7 @@ static class Program
             typeof(DynamicDeserializationBenchmark),
             typeof(JsonDeserializationBenchmark)
         ]);
-        switcher.Run();
+        switcher.Run(args);
 
         // var path = Path.Combine(Directory.GetCurrentDirectory(), "Examples", "sample_envoy.yaml");
         // var yamlBytes = File.ReadAllBytes(path);

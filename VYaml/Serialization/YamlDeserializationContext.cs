@@ -9,7 +9,7 @@ namespace VYaml.Serialization
         public YamlSerializerOptions Options { get; set; }
         public IYamlFormatterResolver Resolver { get; set; }
 
-        readonly Dictionary<Anchor, object?> aliases = new();
+        Dictionary<Anchor, object?>? aliases;
 
         public YamlDeserializationContext(YamlSerializerOptions options)
         {
@@ -19,17 +19,31 @@ namespace VYaml.Serialization
 
         public void Reset()
         {
-            aliases.Clear();
+            aliases?.Clear();
         }
 
         public T DeserializeWithAlias<T>(ref YamlParser parser)
         {
             var formatter = Resolver.GetFormatterWithVerify<T>();
+            
+            // Fast path: If document has no anchors/aliases at all, skip all alias checking
+            if (!parser.HasAnchors)
+            {
+                return formatter.Deserialize(ref parser, this);
+            }
+
             return DeserializeWithAlias(formatter, ref parser);
         }
 
         public T DeserializeWithAlias<T>(IYamlFormatter<T> innerFormatter, ref YamlParser parser)
         {
+            // Fast path: If document has no anchors/aliases at all, skip all alias checking
+            if (!parser.HasAnchors)
+            {
+                return innerFormatter.Deserialize(ref parser, this);
+            }
+
+            // Original path with alias checking
             if (TryResolveCurrentAlias<T>(ref parser, out var aliasValue))
             {
                 return aliasValue!;
@@ -48,6 +62,7 @@ namespace VYaml.Serialization
 
         void RegisterAnchor(Anchor anchor, object? value)
         {
+            aliases ??= new Dictionary<Anchor, object?>();
             aliases[anchor] = value;
         }
 
@@ -62,7 +77,7 @@ namespace VYaml.Serialization
             if (parser.TryGetCurrentAnchor(out var anchor))
             {
                 parser.Read();
-                if (aliases.TryGetValue(anchor, out var obj))
+                if (aliases != null && aliases.TryGetValue(anchor, out var obj))
                 {
                     switch (obj)
                     {

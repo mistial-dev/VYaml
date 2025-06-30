@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Buffers.Text;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using VYaml.Internal;
@@ -12,17 +13,30 @@ namespace VYaml.Parser
     {
         public static readonly ScalarPool Shared = new();
 
+        [ThreadStatic]
+        static Stack<Scalar>? threadLocalPool;
+        
         readonly ConcurrentQueue<Scalar> items = new();
         Scalar? fastItem;
 
         public Scalar Rent()
         {
+            // Fast path for thread-local access
+            var localPool = threadLocalPool;
+            if (localPool != null && localPool.Count > 0)
+            {
+                return localPool.Pop();
+            }
+            
+            // Try fast single item
             var value = fastItem;
             if (value != null &&
                 Interlocked.CompareExchange(ref fastItem, null, value) == value)
             {
                 return value;
             }
+            
+            // Fallback to concurrent queue
             if (items.TryDequeue(out value))
             {
                 return value;
@@ -34,6 +48,15 @@ namespace VYaml.Parser
         {
             value.Clear();
 
+            // Fast path for thread-local return
+            var localPool = threadLocalPool ??= new Stack<Scalar>(8);
+            if (localPool.Count < 8) // Keep up to 8 scalars per thread
+            {
+                localPool.Push(value);
+                return;
+            }
+            
+            // Fallback to shared pool
             if (fastItem != null ||
                 Interlocked.CompareExchange(ref fastItem, value, null) != null)
             {
@@ -42,15 +65,28 @@ namespace VYaml.Parser
         }
     }
 
+    enum ScalarTypeHint : byte
+    {
+        Unknown,
+        Integer,
+        Float,
+        Boolean,
+        Null,
+        String
+    }
+
     class Scalar : ITokenContent
     {
         const int MinimumGrow = 4;
         const int GrowFactor = 200;
+        const int SmallBufferThreshold = 1024;
+        const int MediumBufferThreshold = 8192;
 
         public static readonly Scalar Null = new(0);
 
         public int Length { get; private set; }
         public TokenType Type { get; set; }
+        internal ScalarTypeHint TypeHint { get; set; }
 
         byte[] buffer;
 
@@ -129,6 +165,7 @@ namespace VYaml.Parser
         public void Clear()
         {
             Length = 0;
+            TypeHint = ScalarTypeHint.Unknown;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -148,6 +185,8 @@ namespace VYaml.Parser
             {
                 return false;
             }
+
+            // Don't use type hint for IsNull - it needs exact pattern matching
 
             var span = AsSpan();
             switch (span.Length)
@@ -176,6 +215,8 @@ namespace VYaml.Parser
                 return false;
             }
 
+            // Type hint optimization disabled for now - needs more work
+
             var span = AsSpan();
             switch (span.Length)
             {
@@ -202,6 +243,8 @@ namespace VYaml.Parser
                 value = default;
                 return false;
             }
+
+            // Type hint optimization disabled for now - needs more work
 
             var span = AsSpan();
 
@@ -389,6 +432,8 @@ namespace VYaml.Parser
                 return false;
             }
 
+            // Type hint optimization disabled for now - needs more work
+
             var span = AsSpan();
             if (Utf8Parser.TryParse(span, out value, out var bytesConsumed) &&
                 bytesConsumed == span.Length)
@@ -454,10 +499,26 @@ namespace VYaml.Parser
             {
                 return;
             }
-            var newCapacity = buffer.Length * GrowFactor / 100;
+            
+            // Tiered growth strategy for better memory efficiency
+            int growthFactor;
+            if (buffer.Length < SmallBufferThreshold)
+            {
+                growthFactor = 200; // 2x for small buffers
+            }
+            else if (buffer.Length < MediumBufferThreshold)
+            {
+                growthFactor = 150; // 1.5x for medium buffers
+            }
+            else
+            {
+                growthFactor = 125; // 1.25x for large buffers
+            }
+            
+            var newCapacity = buffer.Length * growthFactor / 100;
             while (newCapacity < sizeHint)
             {
-                newCapacity = newCapacity * GrowFactor / 100;
+                newCapacity = newCapacity * growthFactor / 100;
             }
             SetCapacity(newCapacity);
         }
@@ -546,7 +607,22 @@ namespace VYaml.Parser
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void Grow()
         {
-            var newCapacity = buffer.Length * GrowFactor / 100;
+            // Use tiered growth strategy for single grow as well
+            int growthFactor;
+            if (buffer.Length < SmallBufferThreshold)
+            {
+                growthFactor = 200; // 2x for small buffers
+            }
+            else if (buffer.Length < MediumBufferThreshold)
+            {
+                growthFactor = 150; // 1.5x for medium buffers
+            }
+            else
+            {
+                growthFactor = 125; // 1.25x for large buffers
+            }
+            
+            var newCapacity = buffer.Length * growthFactor / 100;
             if (newCapacity < buffer.Length + MinimumGrow)
             {
                 newCapacity = buffer.Length + MinimumGrow;
@@ -569,6 +645,73 @@ namespace VYaml.Parser
         private bool IsStringScalar()
         {
             return Type is TokenType.DoubleQuotedScaler or TokenType.SingleQuotedScaler;
+        }
+
+        /// <summary>
+        /// Detects the scalar type based on the first few bytes for optimization
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void DetectTypeHint()
+        {
+            if (IsStringScalar())
+            {
+                TypeHint = ScalarTypeHint.String;
+                return;
+            }
+
+            var span = AsSpan();
+            if (span.Length == 0)
+            {
+                TypeHint = ScalarTypeHint.Null;
+                return;
+            }
+
+            var first = span[0];
+            
+            // Quick null check
+            if (span.Length == 1 && first == YamlCodes.NullAlias)
+            {
+                TypeHint = ScalarTypeHint.Null;
+                return;
+            }
+            
+            // Quick boolean check
+            if (span.Length >= 4 && span.Length <= 5)
+            {
+                if (first == (byte)'t' || first == (byte)'T' || first == (byte)'f' || first == (byte)'F')
+                {
+                    TypeHint = ScalarTypeHint.Boolean;
+                    return;
+                }
+            }
+            
+            // Quick null word check - removed as it needs exact matching, not just first letter
+            
+            // Numeric check
+            if (first >= (byte)'0' && first <= (byte)'9' || first == (byte)'-' || first == (byte)'+' || first == (byte)'.')
+            {
+                // Quick check for float starting with '.'
+                if (first == (byte)'.')
+                {
+                    TypeHint = ScalarTypeHint.Float;
+                    return;
+                }
+                
+                // Scan for float indicators
+                for (int i = 1; i < span.Length; i++)
+                {
+                    var b = span[i];
+                    if (b == (byte)'.' || b == (byte)'e' || b == (byte)'E')
+                    {
+                        TypeHint = ScalarTypeHint.Float;
+                        return;
+                    }
+                }
+                TypeHint = ScalarTypeHint.Integer;
+                return;
+            }
+            
+            TypeHint = ScalarTypeHint.String;
         }
     }
 }

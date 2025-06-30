@@ -146,6 +146,7 @@ namespace VYaml.Parser
             return false;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void ConsumeMoreTokens()
         {
             while (true)
@@ -1364,7 +1365,7 @@ namespace VYaml.Parser
             simpleKeyAllowed = isLeadingBlanks;
 
             // From spec: To ensure JSON compatibility, if a key inside a flow mapping is JSON-like,
-            // YAML allows the following value to be specified adjacent to the “:”.
+            // YAML allows the following value to be specified adjacent to the ":".
             adjacentValueAllowedAt = mark.Position;
 
             tokens.Enqueue(new Token(singleQuote
@@ -1373,6 +1374,7 @@ namespace VYaml.Parser
                 scalar));
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void ConsumePlainScalar()
         {
             SaveSimpleKeyCandidate();
@@ -1456,17 +1458,8 @@ namespace VYaml.Parser
                         }
                     }
 
-                    // Handle UTF-8 sequences atomically
-                    var sequenceLength = YamlCodes.GetUtf8SequenceLength(currentCode);
-                    for (int i = 0; i < sequenceLength && !reader.End; i++)
-                    {
-                        scalar.Write(currentCode);
-                        Advance(1);
-                        if (i < sequenceLength - 1 && !reader.End)
-                        {
-                            reader.TryPeek(out currentCode);
-                        }
-                    }
+                    scalar.Write(currentCode);
+                    Advance(1);
                 }
 
                 // is the end?
@@ -1526,6 +1519,7 @@ namespace VYaml.Parser
             tokens.Enqueue(new Token(TokenType.PlainScalar, scalar));
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void SkipToNextToken()
         {
             while (true)
@@ -1569,6 +1563,24 @@ namespace VYaml.Parser
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void Advance(int offset)
         {
+            // Fast path for single byte advance (most common case)
+            if (offset == 1)
+            {
+                Advance1();
+                return;
+            }
+            
+            // Optimize for small offsets
+            if (offset <= 4)
+            {
+                for (var i = 0; i < offset; i++)
+                {
+                    Advance1();
+                }
+                return;
+            }
+            
+            // General case
             for (var i = 0; i < offset; i++)
             {
                 mark.Position += 1;
@@ -1584,6 +1596,25 @@ namespace VYaml.Parser
                 reader.Advance(1);
                 reader.TryPeek(out currentCode);
             }
+        }
+        
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        void Advance1()
+        {
+            mark.Position += 1;
+            
+            if (currentCode == YamlCodes.Lf)
+            {
+                mark.Line += 1;
+                mark.Col = 0;
+            }
+            else
+            {
+                mark.Col += 1;
+            }
+            
+            reader.Advance(1);
+            reader.TryPeek(out currentCode);
         }
 
         /// <summary>
@@ -1740,7 +1771,7 @@ namespace VYaml.Parser
             simpleKeyCandidates.Pop();
         }
 
-        readonly bool IsEmptyNext(int offset)
+        bool IsEmptyNext(int offset)
         {
             if (reader.End || reader.Remaining <= offset)
                 return true;
@@ -1776,7 +1807,7 @@ namespace VYaml.Parser
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        readonly bool TryPeek(long offset, out byte value)
+        bool TryPeek(long offset, out byte value)
         {
             // If we've got data and offset is not out of bounds
             if (reader.End || reader.Remaining <= offset)
@@ -1818,4 +1849,3 @@ namespace VYaml.Parser
         }
     }
 }
-

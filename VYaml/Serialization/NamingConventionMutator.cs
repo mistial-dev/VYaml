@@ -1,5 +1,6 @@
 using System;
 using VYaml.Annotations;
+using VYaml.Internal;
 
 namespace VYaml.Serialization
 {
@@ -71,13 +72,32 @@ namespace VYaml.Serialization
         public static string Mutate(string source, NamingConvention namingConvention)
         {
             var mutator = Of(namingConvention);
-            Span<char> destination = stackalloc char[source.Length * 2];
-            while (!mutator.TryMutate(source.AsSpan(), destination, out var written))
+            
+            // Try stack allocation for reasonable sizes
+            var bufferSize = PlatformStackLimits.GetInitialBufferSize(source.Length);
+            if (PlatformStackLimits.ShouldUseStackAlloc(bufferSize))
             {
-                // ReSharper disable once StackAllocInsideLoop
-                destination = stackalloc char[destination.Length * 2];
+                Span<char> stackBuffer = stackalloc char[bufferSize];
+                if (mutator.TryMutate(source.AsSpan(), stackBuffer, out var written))
+                {
+                    return stackBuffer.Slice(0, written).ToString();
+                }
             }
-            return destination.ToString();
+            
+            // Fall back to pooled buffer for larger strings or failed attempts
+            var buffer = CharBufferPool.Rent(source.Length * 3);
+            try
+            {
+                if (!mutator.TryMutate(source.AsSpan(), buffer, out var written))
+                {
+                    throw new InvalidOperationException($"Failed to mutate string: {source}");
+                }
+                return new string(buffer, 0, written);
+            }
+            finally
+            {
+                CharBufferPool.Return(buffer);
+            }
         }
 
         public static INamingConventionMutator Of(NamingConvention namingConvention) => namingConvention switch

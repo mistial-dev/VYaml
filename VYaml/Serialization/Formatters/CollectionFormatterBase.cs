@@ -17,12 +17,27 @@ namespace VYaml.Serialization
             else
             {
                 emitter.BeginSequence();
-                if (GetCount(value) > 0)
+                var count = GetCount(value);
+                if (count > 0)
                 {
+                    // Cache formatter lookup outside the loop
                     var elementFormatter = context.Resolver.GetFormatterWithVerify<TElement>();
-                    foreach (var x in value)
+                    
+                    // For collections with known count, we can optimize further
+                    if (count.HasValue && value is IList<TElement> list)
                     {
-                        elementFormatter.Serialize(ref emitter, x, context);
+                        // Direct indexing is often faster than foreach for lists
+                        for (int i = 0; i < count.Value; i++)
+                        {
+                            elementFormatter.Serialize(ref emitter, list[i], context);
+                        }
+                    }
+                    else
+                    {
+                        foreach (var x in value)
+                        {
+                            elementFormatter.Serialize(ref emitter, x, context);
+                        }
                     }
                 }
                 emitter.EndSequence();
@@ -42,6 +57,13 @@ namespace VYaml.Serialization
 
             var list = Create(context.Options);
             var elementFormatter = context.Resolver.GetFormatterWithVerify<TElement>();
+            
+            // Pre-size collections if possible to avoid resizing
+            if (list is List<TElement> concreteList)
+            {
+                concreteList.Capacity = 16; // Reasonable default to avoid initial resizes
+            }
+            
             while (!parser.End && parser.CurrentEventType != ParseEventType.SequenceEnd)
             {
                 var value = context.DeserializeWithAlias(elementFormatter, ref parser);

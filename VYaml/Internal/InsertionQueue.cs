@@ -23,6 +23,8 @@ namespace VYaml.Internal
         public InsertionQueue(int capacity)
         {
             if (capacity < 0) throw new ArgumentOutOfRangeException("capacity");
+            // Ensure capacity is power of 2 for fast bit masking
+            capacity = GetNextPowerOfTwo(capacity);
             array = new T[capacity];
             headIndex = tailIndex = Count = 0;
         }
@@ -72,22 +74,20 @@ namespace VYaml.Internal
             MoveNext(ref tailIndex);
             Count++;
 
+            var mask = array.Length - 1;
             for (var pos = Count - 1; pos > posTo; pos--)
             {
-                var index = (headIndex + pos) % array.Length;
+                var index = (headIndex + pos) & mask;
                 var indexPrev = index == 0 ? array.Length - 1 : index - 1;
                 array[index] = array[indexPrev];
             }
-            array[(posTo + headIndex) % array.Length] = item;
+            array[(posTo + headIndex) & mask] = item;
         }
 
         void Grow()
         {
-            var newCapacity = (int)((long)array.Length * GrowFactor / 100);
-            if (newCapacity < array.Length + MinimumGrow)
-            {
-                newCapacity = array.Length + MinimumGrow;
-            }
+            // Always double for power-of-2 growth
+            var newCapacity = array.Length * 2;
             SetCapacity(newCapacity);
         }
 
@@ -115,13 +115,31 @@ namespace VYaml.Internal
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void MoveNext(ref int index)
         {
-            index = (index + 1) % array.Length;
+            // Use bit masking instead of modulo for power-of-2 sizes
+            index = (index + 1) & (array.Length - 1);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static void ThrowForEmptyQueue()
         {
             throw new InvalidOperationException("EmptyQueue");
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int GetNextPowerOfTwo(int value)
+        {
+            if (value < 2) return 2;
+            
+            // Find the next power of 2
+            value--;
+            value |= value >> 1;
+            value |= value >> 2;
+            value |= value >> 4;
+            value |= value >> 8;
+            value |= value >> 16;
+            value++;
+            
+            return value;
         }
     }
 }

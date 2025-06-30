@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Runtime.Serialization;
 using VYaml.Annotations;
 using VYaml.Emitter;
+using VYaml.Internal;
 using VYaml.Parser;
 
 namespace VYaml.Serialization
@@ -34,15 +35,33 @@ namespace VYaml.Serialization
             var name = Enum.GetName(type, value)!;
             var namingConvention = GetNamingConventionByType(type) ?? context.Options.NamingConvention;
             var mutator = NamingConventionMutator.Of(namingConvention);
-            Span<char> destination = stackalloc char[name.Length * 2];
-            int written;
-            while (!mutator.TryMutate(name.AsSpan(), destination, out written))
+            
+            // Try stack allocation for small names
+            var bufferSize = PlatformStackLimits.GetInitialBufferSize(name.Length);
+            if (PlatformStackLimits.ShouldUseStackAlloc(bufferSize))
             {
-                // ReSharper disable once StackAllocInsideLoop
-                destination = stackalloc char[destination.Length * 2];
+                Span<char> destination = stackalloc char[bufferSize];
+                if (mutator.TryMutate(name.AsSpan(), destination, out var written))
+                {
+                    emitter.WriteString(destination[..written].ToString());
+                    return;
+                }
             }
-
-            emitter.WriteString(destination[..written].ToString());
+            
+            // Fall back to pooled buffer for larger names or failed attempts
+            var buffer = CharBufferPool.Rent(name.Length * 3);
+            try
+            {
+                if (!mutator.TryMutate(name.AsSpan(), buffer, out var written))
+                {
+                    throw new InvalidOperationException($"Failed to mutate enum name: {name}");
+                }
+                emitter.WriteString(new string(buffer, 0, written));
+            }
+            finally
+            {
+                CharBufferPool.Return(buffer);
+            }
         }
 
         static NamingConvention? AnalyzeNamingConventionByType(Type type)
@@ -94,15 +113,15 @@ namespace VYaml.Serialization
                 {
                     var mutator = NamingConventionMutator.Of(NamingConventionByType ?? YamlSerializerOptions.DefaultNamingConvention);
                     var name = Enum.GetName(type, value)!;
-                    Span<char> destination = stackalloc char[name.Length];
-                    int written;
-                    while (!mutator.TryMutate(name.AsSpan(), destination, out written))
+                    
+                    // Static constructor runs once, so we can use a larger buffer
+                    var buffer = new char[name.Length * 3];
+                    if (!mutator.TryMutate(name.AsSpan(), buffer, out var written))
                     {
-                        // ReSharper disable once StackAllocInsideLoop
-                        destination = stackalloc char[destination.Length * 2];
+                        throw new InvalidOperationException($"Failed to mutate enum name: {name}");
                     }
-
-                    var stringValue = destination[..written].ToString();
+                    
+                    var stringValue = new string(buffer, 0, written);
                     StringValues.Add((T)value, (stringValue, false));
                     Values.Add(stringValue, (T)value);
                 }
@@ -125,21 +144,45 @@ namespace VYaml.Serialization
             }
 
             var mutator = NamingConventionMutator.Of(NamingConventionByType ?? context.Options.NamingConvention);
-            Span<char> buffer = stackalloc char[stringValue.Length];
-
-            int bytesWritten;
-            while (!mutator.TryMutate(stringValue.AsSpan(), buffer, out bytesWritten))
+            
+            // Try stack allocation first
+            var bufferSize = PlatformStackLimits.GetInitialBufferSize(stringValue.Length);
+            if (PlatformStackLimits.ShouldUseStackAlloc(bufferSize))
             {
-                // ReSharper disable once StackAllocInsideLoop
-                buffer = stackalloc char[buffer.Length * 2];
-            }
-
-            unsafe
-            {
-                fixed (char* ptr = buffer)
+                Span<char> stackBuffer = stackalloc char[bufferSize];
+                if (mutator.TryMutate(stringValue.AsSpan(), stackBuffer, out var written))
                 {
-                    emitter.WriteString(ptr, bytesWritten);
+                    unsafe
+                    {
+                        fixed (char* ptr = stackBuffer)
+                        {
+                            emitter.WriteString(ptr, written);
+                        }
+                    }
+                    return;
                 }
+            }
+            
+            // Fall back to pooled buffer
+            var buffer = CharBufferPool.Rent(stringValue.Length * 3);
+            try
+            {
+                if (!mutator.TryMutate(stringValue.AsSpan(), buffer, out var bytesWritten))
+                {
+                    throw new InvalidOperationException($"Failed to mutate string value: {stringValue}");
+                }
+                
+                unsafe
+                {
+                    fixed (char* ptr = buffer)
+                    {
+                        emitter.WriteString(ptr, bytesWritten);
+                    }
+                }
+            }
+            finally
+            {
+                CharBufferPool.Return(buffer);
             }
         }
 
@@ -159,15 +202,51 @@ namespace VYaml.Serialization
 
 
             var mutator = NamingConventionMutator.Of(NamingConventionByType ?? YamlSerializerOptions.DefaultNamingConvention);
-            Span<char> buffer = stackalloc char[scalar.Length];
-            int bytesWritten;
-            while (!mutator.TryMutate(scalar.AsSpan(), buffer, out bytesWritten))
+            
+            string mutatedScalar;
+            var bufferSize = PlatformStackLimits.GetInitialBufferSize(scalar.Length);
+            if (PlatformStackLimits.ShouldUseStackAlloc(bufferSize))
             {
-                // ReSharper disable once StackAllocInsideLoop
-                buffer = stackalloc char[buffer.Length * 2];
+                Span<char> stackBuffer = stackalloc char[bufferSize];
+                if (mutator.TryMutate(scalar.AsSpan(), stackBuffer, out var written))
+                {
+                    mutatedScalar = stackBuffer[..written].ToString();
+                }
+                else
+                {
+                    // Fall back to pooled buffer
+                    var pooledBuffer = CharBufferPool.Rent(scalar.Length * 3);
+                    try
+                    {
+                        if (!mutator.TryMutate(scalar.AsSpan(), pooledBuffer, out written))
+                        {
+                            throw new InvalidOperationException($"Failed to mutate scalar: {scalar}");
+                        }
+                        mutatedScalar = new string(pooledBuffer, 0, written);
+                    }
+                    finally
+                    {
+                        CharBufferPool.Return(pooledBuffer);
+                    }
+                }
             }
-
-            var mutatedScalar = buffer[..bytesWritten].ToString();
+            else
+            {
+                // Use pooled buffer for large scalars
+                var buffer = CharBufferPool.Rent(scalar.Length * 3);
+                try
+                {
+                    if (!mutator.TryMutate(scalar.AsSpan(), buffer, out var bytesWritten))
+                    {
+                        throw new InvalidOperationException($"Failed to mutate scalar: {scalar}");
+                    }
+                    mutatedScalar = new string(buffer, 0, bytesWritten);
+                }
+                finally
+                {
+                    CharBufferPool.Return(buffer);
+                }
+            }
             parser.Read();
             if (Values.TryGetValue(mutatedScalar, out value))
             {

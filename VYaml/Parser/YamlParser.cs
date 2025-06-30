@@ -77,6 +77,9 @@ namespace VYaml.Parser
         [ThreadStatic]
         static ExpandBuffer<ParseState>? stateStackBufferStatic;
 
+        [ThreadStatic]
+        static Stack<(Dictionary<string, int> anchors, ExpandBuffer<ParseState> stack)>? nestedContextPool;
+
         public static YamlParser FromBytes(Memory<byte> bytes)
         {
             var sequence = new ReadOnlySequence<byte>(bytes);
@@ -90,6 +93,7 @@ namespace VYaml.Parser
 
         public ParseEventType CurrentEventType { get; private set; }
         public bool UnityStrippedMark { get; private set; }
+        public bool HasAnchors { get; private set; }
 
         public readonly Marker CurrentMark
         {
@@ -112,7 +116,7 @@ namespace VYaml.Parser
         Anchor? currentAnchor;
         int lastAnchorId;
 
-        readonly Dictionary<string, int> anchors;
+        Dictionary<string, int>? anchors; // Lazy initialization
         readonly ExpandBuffer<ParseState> stateStack;
         readonly YamlParserOptions options;
 
@@ -131,16 +135,27 @@ namespace VYaml.Parser
             // Check if the static buffers are in use (nested parsing scenario)
             if (stateStackBufferStatic != null && stateStackBufferStatic.Length > 0)
             {
-                // Create new instances for nested parsing
-                anchors = new Dictionary<string, int>();
-                stateStack = new ExpandBuffer<ParseState>(16);
+                // Try to reuse from nested context pool
+                nestedContextPool ??= new Stack<(Dictionary<string, int>, ExpandBuffer<ParseState>)>();
+                if (nestedContextPool.Count > 0)
+                {
+                    var context = nestedContextPool.Pop();
+                    anchors = null; // Lazy init only when needed
+                    stateStack = context.stack;
+                    stateStack.Clear();
+                }
+                else
+                {
+                    // Create new instances for nested parsing
+                    anchors = null; // Lazy init only when needed
+                    stateStack = new ExpandBuffer<ParseState>(16);
+                }
             }
             else
             {
                 // Reuse static buffers for performance
-                anchors = anchorsBufferStatic ??= new Dictionary<string, int>();
-                anchors.Clear();
-
+                anchors = null; // Lazy init only when needed
+                
                 stateStack = stateStackBufferStatic ??= new ExpandBuffer<ParseState>(16);
                 stateStack.Clear();
             }
@@ -150,6 +165,7 @@ namespace VYaml.Parser
             currentAnchor = null;
 
             UnityStrippedMark = false;
+            HasAnchors = false;
         }
 
         public YamlParser(ref Utf8YamlTokenizer tokenizer, YamlParserOptions? options = null)
@@ -167,8 +183,10 @@ namespace VYaml.Parser
             currentAnchor = null;
 
             UnityStrippedMark = false;
+            HasAnchors = false;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool Read()
         {
             if (currentScalar is { } scalar)
@@ -183,8 +201,40 @@ namespace VYaml.Parser
                 return false;
             }
 
+            // Optimize for most common states first (based on typical YAML structure)
             switch (currentState)
             {
+                // Most common states during parsing
+                case ParseState.BlockNode:
+                    ParseNode(true, false);
+                    break;
+
+                case ParseState.BlockMappingValue:
+                    ParseBlockMappingValue();
+                    break;
+
+                case ParseState.BlockMappingKey:
+                    ParseBlockMappingKey(false);
+                    break;
+
+                case ParseState.BlockSequenceEntry:
+                    ParseBlockSequenceEntry(false);
+                    break;
+
+                // Less common but still frequent
+                case ParseState.BlockMappingFirstKey:
+                    ParseBlockMappingKey(true);
+                    break;
+
+                case ParseState.BlockSequenceFirstEntry:
+                    ParseBlockSequenceEntry(true);
+                    break;
+
+                case ParseState.DocumentContent:
+                    ParseDocumentContent();
+                    break;
+
+                // Initialization states (less frequent)
                 case ParseState.StreamStart:
                     ParseStreamStart();
                     break;
@@ -197,36 +247,8 @@ namespace VYaml.Parser
                     ParseDocumentStart(false);
                     break;
 
-                case ParseState.DocumentContent:
-                    ParseDocumentContent();
-                    break;
-
                 case ParseState.DocumentEnd:
                     ParseDocumentEnd();
-                    break;
-
-                case ParseState.BlockNode:
-                    ParseNode(true, false);
-                    break;
-
-                case ParseState.BlockMappingFirstKey:
-                    ParseBlockMappingKey(true);
-                    break;
-
-                case ParseState.BlockMappingKey:
-                    ParseBlockMappingKey(false);
-                    break;
-
-                case ParseState.BlockMappingValue:
-                    ParseBlockMappingValue();
-                    break;
-
-                case ParseState.BlockSequenceFirstEntry:
-                    ParseBlockSequenceEntry(true);
-                    break;
-
-                case ParseState.BlockSequenceEntry:
-                    ParseBlockSequenceEntry(false);
                     break;
 
                 case ParseState.FlowSequenceFirstEntry:
@@ -424,7 +446,7 @@ namespace VYaml.Parser
         void ParseDocumentContent()
         {
             // Check for comments at document content level
-            if (TryEmitComment())
+            if (options.PreserveComments && TryEmitComment())
             {
                 return;
             }
@@ -455,8 +477,9 @@ namespace VYaml.Parser
             }
 
             // Clear anchors at document boundary per YAML 1.2 spec section 3.2.2.2
-            anchors.Clear();
+            anchors?.Clear();
             lastAnchorId = 0;
+            HasAnchors = false;
 
             // TODO tag handling
             currentState = ParseState.DocumentStart;
@@ -466,7 +489,7 @@ namespace VYaml.Parser
         void ParseNode(bool block, bool indentlessSequence)
         {
             // Check for comments before parsing node
-            if (TryEmitComment())
+            if (options.PreserveComments && TryEmitComment())
             {
                 return;
             }
@@ -483,10 +506,11 @@ namespace VYaml.Parser
                     var name = tokenizer.TakeCurrentTokenContent<Scalar>().ToString();  // TODO: Avoid `ToString`
                     tokenizer.Read();
 
-                    if (anchors.TryGetValue(name, out var aliasId))
+                    if (anchors != null && anchors.TryGetValue(name, out var aliasId))
                     {
                         currentAnchor = new Anchor(name, aliasId);
                         CurrentEventType = ParseEventType.Alias;
+                        HasAnchors = true;
                         return;
                     }
                     throw new YamlParserException(CurrentMark, "While parsing node, found unknown anchor");
@@ -496,6 +520,7 @@ namespace VYaml.Parser
                     var anchorName = tokenizer.TakeCurrentTokenContent<Scalar>().ToString(); // TODO: Avoid `ToString`
                     var anchorId = RegisterAnchor(anchorName);
                     currentAnchor = new Anchor(anchorName, anchorId);
+                    HasAnchors = true;
                     tokenizer.Read();
                     if (CurrentTokenType == TokenType.Tag)
                     {
@@ -513,6 +538,7 @@ namespace VYaml.Parser
                         var anchorName = tokenizer.TakeCurrentTokenContent<Scalar>().ToString();
                         var anchorId = RegisterAnchor(anchorName);
                         currentAnchor = new Anchor(anchorName, anchorId);
+                        HasAnchors = true;
 
                         // Unity compatible mode
                         if (CurrentEventType == ParseEventType.DocumentStart &&
@@ -593,7 +619,7 @@ namespace VYaml.Parser
             }
 
             // Check for comments between mapping entries
-            if (TryEmitComment())
+            if (options.PreserveComments && TryEmitComment())
             {
                 return;
             }
@@ -641,7 +667,7 @@ namespace VYaml.Parser
                 tokenizer.Read();
                 
                 // Check for comments after colon but stay in same state
-                if (CurrentTokenType == TokenType.Comment && TryEmitComment())
+                if (options.PreserveComments && CurrentTokenType == TokenType.Comment && TryEmitComment())
                 {
                     // After emitting comment, stay in ParseBlockMappingValue state
                     // to parse the actual value on next Read()
@@ -666,7 +692,7 @@ namespace VYaml.Parser
             {
                 // This path handles the case after comment emission
                 // Check for comments first
-                if (TryEmitComment())
+                if (options.PreserveComments && TryEmitComment())
                 {
                     return;
                 }
@@ -697,7 +723,7 @@ namespace VYaml.Parser
             }
 
             // Check for comments in sequences
-            if (TryEmitComment())
+            if (options.PreserveComments && TryEmitComment())
             {
                 return;
             }
@@ -984,6 +1010,13 @@ namespace VYaml.Parser
 
         int RegisterAnchor(string anchorName)
         {
+            // Lazy initialize anchors dictionary only when first anchor is encountered
+            if (anchors == null)
+            {
+                anchors = anchorsBufferStatic ??= new Dictionary<string, int>();
+                anchors.Clear();
+            }
+            
             var newId = ++lastAnchorId;
             anchors[anchorName] = newId; // TODO: Avoid `ToString`
             return newId;

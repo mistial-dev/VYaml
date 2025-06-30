@@ -33,7 +33,18 @@ namespace VYaml.Emitter
         /// An integer representing the current indentation level of the value.
         /// </returns>
         private int GetCurrentValueIndent() => currentIndentLevel + 1;
-        static byte[] whiteSpaces = "                                "u8.ToArray();
+        // Pre-allocate 128 spaces to avoid allocations during indent operations
+        static byte[] whiteSpaces = CreateWhiteSpaceArray(128);
+        
+        static byte[] CreateWhiteSpaceArray(int length)
+        {
+            var array = new byte[length];
+            for (int i = 0; i < length; i++)
+            {
+                array[i] = YamlCodes.Space;
+            }
+            return array;
+        }
         static readonly byte[] FlowSequenceEmpty = "[]"u8.ToArray();
         static readonly byte[] FlowSequenceEmptyWithSpace = " []"u8.ToArray();
         static readonly byte[] FlowSequenceSeparator = ", "u8.ToArray();
@@ -854,7 +865,9 @@ namespace VYaml.Emitter
 
             if (length > whiteSpaces.Length)
             {
-                whiteSpaces = Enumerable.Repeat(YamlCodes.Space, length * 2).ToArray();
+                // Grow the array efficiently without LINQ
+                var newSize = Math.Max(length * 2, whiteSpaces.Length * 2);
+                whiteSpaces = CreateWhiteSpaceArray(newSize);
             }
             whiteSpaces.AsSpan(0, length).CopyTo(output[offset..]);
             offset += length;
